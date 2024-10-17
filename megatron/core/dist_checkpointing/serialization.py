@@ -10,6 +10,8 @@ loading the sharded tensors.
 
 import logging
 from pathlib import Path
+from pathlib_abc import PathBase
+
 from typing import Dict, Optional, Set, Tuple, Union
 
 import torch
@@ -35,7 +37,8 @@ from .strategies.base import (
     StrategyAction,
     get_default_strategy,
 )
-from .utils import extract_sharded_base
+from .strategies.common import TorchCommonSaveStrategy
+from .utils import extract_nonpersistent, extract_sharded_base
 from .validation import (
     StrictHandling,
     determine_global_metadata,
@@ -101,7 +104,9 @@ def load(
         checkpoint_dir, sharded_strategy, common_strategy
     )
 
-    checkpoint_dir = Path(checkpoint_dir)
+    if not isinstance(checkpoint_dir, PathBase):
+        checkpoint_dir = Path(checkpoint_dir)
+
     common_state_dict = common_strategy.load_common(checkpoint_dir)
     if not sharded_state_dict:
         return common_state_dict
@@ -198,7 +203,9 @@ def load_tensors_metadata(
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy
     )
-    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+    if not isinstance(checkpoint_dir, PathBase):
+        checkpoint_dir = Path(checkpoint_dir)
+    return sharded_strategy.load_tensors_metadata(checkpoint_dir)
 
 
 def load_sharded_metadata(
@@ -236,10 +243,12 @@ def load_sharded_metadata(
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy, common_strategy
     )
-    sharded_metadata = sharded_strategy.load_sharded_metadata(Path(checkpoint_dir))
+    if not isinstance(checkpoint_dir, PathBase):
+        checkpoint_dir = Path(checkpoint_dir)
+    sharded_metadata = sharded_strategy.load_sharded_metadata(checkpoint_dir)
     if not sharded_strategy.can_handle_sharded_objects:
         validate_sharded_objects_handling(sharded_strategy, common_strategy)
-        common_metadata = common_strategy.load_sharded_metadata(Path(checkpoint_dir))
+        common_metadata = common_strategy.load_sharded_metadata(checkpoint_dir)
         sharded_metadata = merge(sharded_metadata, common_metadata)
     return sharded_metadata
 
@@ -331,7 +340,8 @@ def save(
             async request that should be scheduled by the caller of this function.
             None otherwise.
     """
-    checkpoint_dir = Path(checkpoint_dir)
+    if not isinstance(checkpoint_dir, PathBase):
+        checkpoint_dir = Path(checkpoint_dir)
 
     if torch.distributed.get_rank() == 0:
         if not checkpoint_dir.exists():
@@ -344,7 +354,7 @@ def save(
                 f'Checkpoint destination directory ({checkpoint_dir}) is not empty'
             )
 
-    if common_strategy is not None:
+    if common_strategy is not None and not isinstance(common_strategy, TorchCommonSaveStrategy):
         raise NotImplementedError('The only supported common strategy is torch')
 
     if sharded_strategy is None:

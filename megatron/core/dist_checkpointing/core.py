@@ -4,10 +4,16 @@
 
 import json
 from dataclasses import asdict, dataclass
+import logging
 from pathlib import Path
 from typing import Optional
 
+from pathlib_abc import PathBase
+
+from s3torchconnectorclient._mountpoint_s3_client import S3Exception
+
 CONFIG_FNAME = 'metadata.json'
+logger = logging.getLogger(__name__)
 
 
 class CheckpointingException(Exception):
@@ -54,7 +60,10 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     Returns:
         CheckpointingConfig (optional): None if checkpoint is not a valid distributed checkpoint
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    if not isinstance(checkpoint_dir, PathBase):
+        config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    else:
+        config_path = checkpoint_dir / CONFIG_FNAME
     if not config_path.exists():
         return None
     with config_path.open() as f:
@@ -72,6 +81,19 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
     Returns:
         None
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
-    with config_path.open('w') as f:
-        json.dump(asdict(config), f)
+    if not isinstance(checkpoint_dir, PathBase):
+        config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    else:
+        config_path = checkpoint_dir / CONFIG_FNAME
+
+    # TODO: simple retry logic
+    max_attempts = 8
+    for i in range(max_attempts):
+        try:
+            with config_path.open('w') as f:
+                json.dump(asdict(config), f)
+            break
+        except S3Exception as e:
+            logger.debug(f"retry {i} encountered s3 exception when saving config: {e}")
+        except Exception as e:
+            logger.debug(f"retry {i} when saving config: {e}")
