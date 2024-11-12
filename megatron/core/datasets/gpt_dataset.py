@@ -4,16 +4,16 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset, _S3BinReader
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils import Split, should_build_on_rank
 from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
 
@@ -48,8 +48,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
-    s3_cache_path: str = None
-    """Path for caching indices for s3 dataloading."""
+    shuffle_documents: bool = True
+    shuffle_samples: bool = True
+    shuffle_block_size: Optional[int] = None
+
+    s3_config: Optional[S3Config] = None
+    """Configuration for IndexedDataset _S3BinReader"""
+
+    s3_separate_cache_size: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -143,8 +149,8 @@ class GPTDataset(MegatronDataset):
             return IndexedDataset(
                 dataset_path,
                 multimodal=False,
-                mmap=config.mmap_bin_files,
-                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+                mmap=False,
+                s3_config=config.s3_config,
             )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
@@ -351,7 +357,10 @@ class GPTDataset(MegatronDataset):
 
         if not path_to_cache or (
             not cache_hit
-            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            and (
+                not torch.distributed.is_initialized()
+                or should_build_on_rank(torch.distributed.get_rank(), self.config.shared_filesystem)
+            )
         ):
 
             log_single_rank(
@@ -407,9 +416,32 @@ class GPTDataset(MegatronDataset):
 
             numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
+            if hasattr(self.dataset, "bin_reader") and isinstance(self.dataset.bin_reader, _S3BinReader):
+                # The config settings matter a lot for the performance of _S3BinReader,
+                # because it streams data into memory block-by-block. We perform some checks
+                # that the config settings will not cause poor performance.
+
+                # Check that `shuffle_documents` is disabled so that the sample with index `i`
+                # and the sample with index `i`+1 are next to each other on disk.
+                assert not self.config.shuffle_documents
+
+                # Check that the number of samples in the data cache is divisible by the number of
+                # samples in a shuffle block to avoid a lot of cache refreshes.
+                sample_ntokens = self.config.sequence_length + self.config.add_extra_token_to_sequence
+                sample_nbytes = self.dataset.index.dtype().itemsize * sample_ntokens
+                # assert self.dataset.bin_reader._cache_nbytes % sample_nbytes == 0
+                data_cache_block_size = -(self.dataset.bin_reader._cache_nbytes // -sample_nbytes)
+
+                if self.config.shuffle_samples:
+                    assert (
+                        data_cache_block_size % self.config.shuffle_block_size == 0
+                    ), f"data_cache_block_size {data_cache_block_size} shuffle_block_size {self.config.shuffle_block_size}"
+
             # Build the document index
+            if not self.config.shuffle_documents:
+                log_single_rank(logger, logging.WARNING, f"Document Shuffling is DISABLED")
             document_index = _build_document_index(
-                self.indices, num_epochs, numpy_random_state, separate_final_epoch
+                self.indices, num_epochs, numpy_random_state, separate_final_epoch, self.config.shuffle_documents
             )
 
             drop_last_partial_sequence = True
@@ -446,14 +478,17 @@ class GPTDataset(MegatronDataset):
             )
 
             # Build the shuffle index
-            if separate_final_epoch:
-                shuffle_index = _build_shuffle_index(
-                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
-                )
+            if not self.config.shuffle_samples:
+                shuffle_index = numpy.arange(sample_index.shape[0], dtype=numpy.uint32)
             else:
-                shuffle_index = _build_shuffle_index(
-                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
-                )
+                if separate_final_epoch:
+                    shuffle_index = _build_shuffle_index(
+                        num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state, self.config.shuffle_block_size,
+                    )
+                else:
+                    shuffle_index = _build_shuffle_index(
+                        sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state, self.config.shuffle_block_size,
+                    )
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
@@ -550,12 +585,33 @@ class GPTDataset(MegatronDataset):
                 num_tokens += num_tokens_per_epoch
         return num_epochs
 
+    @staticmethod
+    def _key_config_attributes() -> List[str]:
+        """Return all config attributes which contribute to uniquely identifying the dataset.
+
+        These attributes will be used to build a uniquely identifying string and MD5 hash which
+        will be used to cache/load dataset resources from run to run.
+
+        Returns:
+            List[str]: The key config attributes
+        """
+        return [
+            "random_seed",
+            "sequence_length",
+            "split",
+            "split_matrix",
+            "shuffle_block_size",
+            "shuffle_documents",
+            "shuffle_samples",
+        ]
+
 
 def _build_document_index(
     documents: numpy.ndarray,
     num_epochs: int,
     numpy_random_state: numpy.random.RandomState,
     separate_final_epoch: bool,
+    shuffle: bool = True,
 ) -> numpy.ndarray:
     """Build an array with length = num epochs * num documents
 
@@ -576,16 +632,66 @@ def _build_document_index(
         document_index[:] = documents
         document_index = document_index.reshape(-1)
         document_index = document_index.astype(numpy.int32)
-        numpy_random_state.shuffle(document_index)
+        if shuffle:
+            numpy_random_state.shuffle(document_index)
         return document_index
 
-    doc_idx_first = _build_document_index(documents, num_epochs - 1, numpy_random_state, False)
-    doc_idx_last = _build_document_index(documents, 1, numpy_random_state, False)
+    doc_idx_first = _build_document_index(documents, num_epochs - 1, numpy_random_state, False, shuffle)
+    doc_idx_last = _build_document_index(documents, 1, numpy_random_state, False, shuffle)
     return numpy.concatenate((doc_idx_first, doc_idx_last))
 
 
+def _block_shuffle(arr: numpy.ndarray, shuffle_block_size: int, np_rng: numpy.random.RandomState) -> numpy.ndarray:
+    """Shuffle blocks of the array and then shuffle within each block.
+    The function divides the given array `arr` into blocks of size
+    `shuffle_block_size`. It first shuffles those blocks and then shuffles
+    within those blocks. The function returns the shuffled array.
+    The purpose of this shuffling strategy is to simulate shuffling
+    with a buffer.
+    Note that if `shuffle_block_size` == 1, then this
+    function is equivalent to:
+    ```python
+    def _block_shuffle(arr, shuffle_block_size, npz_rng):
+        np_rng.shuffle(arr)
+        return arr
+    ```
+    For example, suppose we call:
+    ```python
+    _shuffle(
+        arr=np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        shuffle_block_size=4,
+        np_rng=np.random.RandomState(seed=0))
+    ```
+    Then the function returns:
+    [10, 11, 8, 9, 4, 6, 5, 7, 3, 0, 2, 1]
+    The blocks are:
+    * [10, 11, 8, 9]
+    * [4, 6, 5, 7]
+    * [3, 0, 2, 1]
+    """
+    assert shuffle_block_size >= 1
+    if shuffle_block_size == 1:
+        # If each block only has 1 element, then we do not need to shuffle
+        # within blocks. We can just shuffle across blocks, which amounts
+        # to shuffling the array.
+        np_rng.shuffle(arr)
+        return arr
+    dtype = arr.dtype
+    starts = numpy.arange(shuffle_block_size, len(arr), shuffle_block_size)
+    blocks = numpy.split(arr, starts)
+    np_rng.shuffle(blocks)
+    for i in range(len(blocks)):
+        np_rng.shuffle(blocks[i])
+    if not blocks:
+        return numpy.array([], dtype=dtype)
+    return numpy.concatenate(blocks)
+
+
 def _build_shuffle_index(
-    num_samples: int, total_size: int, numpy_random_state: numpy.random.RandomState
+    num_samples: int,
+    total_size: int,
+    numpy_random_state: numpy.random.RandomState,
+    shuffle_block_size: Optional[int] = None,
 ) -> numpy.ndarray:
     """Build the range [0, size) and shuffle
 
@@ -599,17 +705,20 @@ def _build_shuffle_index(
     Returns:
         numpy.ndarray: The shuffle index
     """
+    if shuffle_block_size is None:
+        shuffle_block_size = num_samples
+
     dtype_ = numpy.uint32
     if total_size >= (numpy.iinfo(numpy.uint32).max - 1):
         dtype_ = numpy.int64
 
     shuffle_idx_first = numpy.arange(start=0, stop=num_samples, step=1, dtype=dtype_)
-    numpy_random_state.shuffle(shuffle_idx_first)
+    shuffle_idx_first = _block_shuffle(shuffle_idx_first, shuffle_block_size, numpy_random_state)
     if num_samples == total_size:
         return shuffle_idx_first
 
     shuffle_idx_last = numpy.arange(start=num_samples, stop=total_size, step=1, dtype=dtype_)
-    numpy_random_state.shuffle(shuffle_idx_last)
+    shuffle_idx_last = _block_shuffle(shuffle_idx_last, shuffle_block_size, numpy_random_state)
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 

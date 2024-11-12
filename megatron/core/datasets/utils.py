@@ -2,6 +2,7 @@
 
 import logging
 from enum import Enum
+import os
 from typing import List, Optional, Tuple
 
 import numpy
@@ -85,3 +86,30 @@ def get_blend_from_list(
     prefix_per_dataset = [rppd.strip() for rppd in raw_prefix_per_dataset]
 
     return prefix_per_dataset, weight_per_dataset
+
+
+def should_build_on_rank(rank: int, shared_filesystem: bool):
+    """
+    Helper function which returns True if some operation, such as caching, should be performed
+    on the current rank. In a distributed setting without a shared filesystem, some caching
+    operations must be performed on each local rank 0 instead of only on global rank 0
+
+    Args:
+        rank (int): global rank
+        shared_filesystem (bool): set to True if using a shared filesystem such as NFS/Lustre for distributed training
+
+    Returns:
+        bool: whether to perform an action for the global rank in the context of shared filesystems
+    """
+
+    if shared_filesystem:
+        return rank == 0
+    else:
+        local_world_size = None
+        for var in ["LOCAL_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_TASKS_PER_NODE"]:
+            if var in os.environ:
+                local_world_size = int(os.environ[var])
+                break
+        if local_world_size is None:
+            local_world_size = torch.cuda.device_count()
+        return rank % local_world_size == 0

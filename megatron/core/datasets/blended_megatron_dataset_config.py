@@ -69,19 +69,18 @@ class BlendedMegatronDatasetConfig:
     tokenizer: Optional[MegatronTokenizer] = None
     """The MegatronTokenizer instance or None. Required for datasets which do online tokenization."""
 
+    shared_filesystem: bool = True
+    """Whether training is done on a shared filesystem such as NFS/Lustre"""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         if self.blend_per_split is not None and any(self.blend_per_split):
             assert self.blend is None, "blend and blend_per_split are incompatible"
             assert self.split is None, "split and blend_per_split are incompatible"
-            assert len(self.blend_per_split) == len(
-                Split
-            ), f"blend_per_split must contain {len(Split)} blends"
+            assert len(self.blend_per_split) == len(Split), f"blend_per_split must contain {len(Split)} blends"
             for split in Split:
                 if self.blend_per_split[split.value] is None:
-                    log_single_rank(
-                        logger, logging.INFO, f"blend not provided for {split.name} split"
-                    )
+                    log_single_rank(logger, logging.INFO, f"blend not provided for {split.name} split")
                 else:
                     assert self.blend_per_split[split.value][1] is None or len(
                         self.blend_per_split[split.value][0]

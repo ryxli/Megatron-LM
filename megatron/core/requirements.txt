@@ -1,2 +1,2 @@
 torch
-packaging
+pathlib_abc

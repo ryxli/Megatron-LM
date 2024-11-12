@@ -60,7 +60,7 @@ class _LocalClient(S3Client):
 
         filename = os.path.join("/", Bucket, Key)
 
-        with open(filename, mode='rb', buffering=0) as bin_buffer_file:
+        with open(filename, mode="rb", buffering=0) as bin_buffer_file:
             bin_buffer_file.seek(_range_beg)
             _bytes = bin_buffer_file.read(_range_end - _range_beg)
 
@@ -72,8 +72,13 @@ class _LocalClient(S3Client):
         pass
 
 
-setattr(boto3, "client", _LocalClient)
+class _LocalSession(boto3.Session):
+    def client(self, *args, **kwargs):
+        return _LocalClient()
 
+
+setattr(boto3, "client", _LocalClient)
+setattr(boto3, "Session", _LocalSession)
 
 ##
 # Overload ClientError from botocore.exceptions
@@ -122,7 +127,7 @@ def test_bin_reader():
                 "--workers",
                 "10",
                 "--log-interval",
-                "1",
+                "100",
             ],
         )
 
@@ -133,6 +138,8 @@ def test_bin_reader():
                 if path.endswith(".bin") or path.endswith(".idx")
             ]
         )
+
+        print(prefixes)
 
         for prefix in prefixes:
             indexed_dataset_file = IndexedDataset(prefix, multimodal=False, mmap=False)
