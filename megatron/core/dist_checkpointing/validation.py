@@ -3,6 +3,7 @@ import logging
 from collections import Counter, defaultdict
 from enum import Enum
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -217,7 +218,11 @@ def verify_checkpoint_and_load_strategy(
             if compatible with the checkpoint content. If None, the default common load strategy
             for the checkpoint backend will be returned.
     """
-    if not Path(checkpoint_dir).exists():
+
+    if not isinstance(checkpoint_dir, PathBase):
+        checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     saved_config = maybe_load_config(checkpoint_dir)

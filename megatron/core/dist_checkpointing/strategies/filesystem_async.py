@@ -8,6 +8,7 @@ import queue
 from contextlib import contextmanager
 from itertools import chain
 from pathlib import Path
+from pathlib_abc import PathBase
 from time import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -22,7 +23,7 @@ from torch.futures import Future
 
 logger = logging.getLogger(__name__)
 
-WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+WriteBucket = Tuple[PathBase, str, Tuple[list, list]]  # represents writes to a single file
 
 _results_queue = None
 
@@ -154,7 +155,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     @staticmethod
     @_disable_gc()
     def write_preloaded_data_multiproc(
-        write_buckets: List[WriteBucket], global_results_queue: mp.Queue
+        write_buckets: List[WriteBucket], global_results_queue: mp.Queue,
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
@@ -270,6 +271,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
                 if use_fsync:
                     os.fsync(stream.fileno())
+
             local_output = (local_proc_idx, local_results)
         except Exception as e:
             local_output = (local_proc_idx, e)
