@@ -2,6 +2,7 @@
 
 import logging
 from enum import Enum
+import os
 from typing import List, Optional, Tuple
 
 import numpy
@@ -85,3 +86,39 @@ def get_blend_from_list(
     prefix_per_dataset = [rppd.strip() for rppd in raw_prefix_per_dataset]
 
     return prefix_per_dataset, weight_per_dataset
+
+
+def should_build_on_rank(shared_filesystem: bool, rank: Optional[int] = None) -> bool:
+    """
+    Determines if an operation, such as caching, should be performed on the current rank.
+
+    In distributed training, operations that do not require duplication (e.g., file caching) 
+    may only need to occur on specific ranks:
+    - If using a shared filesystem (e.g., NFS, Lustre), the operation should be performed 
+      only on the global rank 0.
+    - Without a shared filesystem, the operation may need to occur on each local rank 0 
+      (one per node) to ensure data is available locally.
+
+    Args:
+        shared_filesystem (bool): Whether a shared filesystem is being used for distributed training.
+        rank (Optional[int]): The global rank of the current process. Defaults to None, in which case
+                              it is determined via `torch.distributed.get_rank()`.
+
+    Returns:
+        bool: True if the operation should be performed on the current rank, False otherwise.
+    """
+    if rank is None:
+        if not torch.distributed.is_initialized():
+            return True
+        rank: int = torch.distributed.get_rank()
+    
+    if shared_filesystem:
+        return rank == 0
+    local_world_size = next(
+        (int(os.environ[var]) for var in ["LOCAL_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_TASKS_PER_NODE"] if var in os.environ),
+        None
+    )
+    # Fallback to GPU count if no variable is set
+    if local_world_size is None:
+        local_world_size = torch.cuda.device_count()
+    return rank % local_world_size == 0

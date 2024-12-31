@@ -4,6 +4,7 @@ import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, List, Optional, Type, Union
+from copy import deepcopy
 
 import numpy
 import torch
@@ -11,7 +12,7 @@ import torch
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, normalize, should_build_on_rank
 from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 from megatron.core.utils import log_single_rank
 
@@ -50,6 +51,7 @@ class BlendedMegatronDatasetBuilder(object):
         self.sizes = sizes
         self.is_built_on_rank = is_built_on_rank
         self.config = config
+        self.shared_filesystem = self.config.shared_filesystem
 
         log_single_rank(
             logger,
@@ -186,10 +188,6 @@ class BlendedMegatronDatasetBuilder(object):
 
             split = self.config.split_matrix
 
-            # Blend consists of a single prefix
-            if len(prefixes) == 1 and weights is None:
-                return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
-
             # Build the mid-level datasets
             if weights is None:
                 sizes_per_dataset = [[None for split in Split] for prefix in prefixes]
@@ -254,13 +252,6 @@ class BlendedMegatronDatasetBuilder(object):
                     if weights is not None:
                         weights = normalize(weights)
 
-                    # Blend consists of a sigle prefix
-                    if len(prefixes) == 1:
-                        blended_datasets[i] = self._build_megatron_dataset_splits(
-                            prefixes[0], split_spoof, sizes_spoof
-                        )[i]
-                        continue
-
                     # Build mid-level datasets
                     if weights is None:
                         sizes_per_dataset = [[None for split in Split] for prefix in prefixes]
@@ -295,6 +286,7 @@ class BlendedMegatronDatasetBuilder(object):
                         BlendedDataset,
                         self.is_built_on_rank,
                         True,  # synchronize_ranks, default behavior to build on rank-0 first
+                        self.shared_filesystem,
                         megatron_datasets,
                         weights,
                         size,
@@ -355,7 +347,7 @@ class BlendedMegatronDatasetBuilder(object):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             # First, build on rank 0
-            if rank == 0:
+            if should_build_on_rank(self.shared_filesystem, rank):
                 num_workers = num_dataset_builder_threads
                 if num_workers > 1:
                     # since only rank 0 is running, scale up the thread count
@@ -370,7 +362,7 @@ class BlendedMegatronDatasetBuilder(object):
             torch.distributed.barrier()
 
             # Then, build on other ranks; guaranteed to be data_cache hit
-            if rank != 0:
+            if not should_build_on_rank(self.shared_filesystem, rank):
                 _threading_helper(
                     megatron_datasets,
                     num_dataset_builder_threads,
@@ -413,11 +405,23 @@ class BlendedMegatronDatasetBuilder(object):
                     torch.distributed.barrier()
             return [None] * len(Split)
 
+        from megatron.core.utils_s3 import is_s3_path
         # Build the low level dataset
-        low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
+        low_level_datasets = None
+        if is_s3_path(dataset_path):
+            # For S3, instance low-level datasets per split due to caching
+            low_level_datasets = [
+                self.cls.build_low_level_dataset(dataset_path, self.config) if split_item is not None else None
+                for split_item in split
+            ]
+        else:
+            low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
+            low_level_datasets = [low_level_dataset] * len(split)
 
         # Build the split indices for the low level dataset
-        num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
+        num_elements = next(
+            self.cls.numel_low_level_dataset(ds) for ds in low_level_datasets if ds is not None
+        )
         split_indices = []
         for i, _ in enumerate(Split):
             if split[i] is not None:
@@ -438,7 +442,8 @@ class BlendedMegatronDatasetBuilder(object):
                         self.cls,
                         self.is_built_on_rank,
                         synchronize_ranks,
-                        low_level_dataset,
+                        self.shared_filesystem,
+                        low_level_datasets[i],
                         dataset_path,
                         split_indices[i],
                         sizes[i],
@@ -454,6 +459,7 @@ class BlendedMegatronDatasetBuilder(object):
         cls: Union[Type[DistributedDataset], Callable],
         is_built_on_rank: Callable,
         synchronize_ranks: bool,
+        shared_filesystem: bool = True,
         *args: Any,
     ) -> Optional[Union[DistributedDataset, Iterable]]:
         """Build the DistributedDataset
@@ -480,7 +486,7 @@ class BlendedMegatronDatasetBuilder(object):
             dataset = None
 
             # First, build on rank 0
-            if rank == 0 and is_built_on_rank():
+            if should_build_on_rank(shared_filesystem, rank) and is_built_on_rank():
                 try:
                     dataset = cls(*args)
                 except OSError as err:

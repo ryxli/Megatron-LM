@@ -1,48 +1,32 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from functools import cache
 import os
-from typing import Any, Dict, NamedTuple, Protocol, Tuple
+from typing import Any, Dict, Protocol, Tuple
+from urllib.parse import urlparse
 
 import torch
 
 try:
     import boto3
+    from botocore.config import Config
     import botocore.exceptions as exceptions
+    from types_boto3_s3.client import S3Client
 except ModuleNotFoundError:
     pass
 
 S3_PREFIX = "s3://"
+ENV_MCORE_S3_REGION = "MCORE_S3_REGION"
+ENV_MCORE_S3_ENDPOINT_URL = "MCORE_S3_ENDPOINT_URL"
 
-
-class S3Config(NamedTuple):
-    """Config when the data (.bin) file and the index (.idx) file are in S3
-
-    TODO: These parameters are few and can be consolidated with parameters specific to bin reader
-    classes - @jkamalu
-
-    Attributes:
-
-        path_to_idx_cache (str): The local directory where we will store the index (.idx) file
-
-        bin_chunk_nbytes (int): If the number of bytes is too small, then we send a request to S3 at each call of the `read` method in _S3BinReader, which is slow, because each request has a fixed cost independent of the size of the byte range requested. If the number of bytes is too large, then we only rarely have to send requests to S3, but it takes a lot of time to complete the request when we do, which can block training. We've found that 256 * 1024 * 1024 (i.e., 256 MiB) has worked well (though we have not put that much effort into tuning it), so we default to it.
-    """
-
-    path_to_idx_cache: str
-
-    bin_chunk_nbytes: int = 256 * 1024 * 1024
-
-
-class S3Client(Protocol):
-    """The protocol which all s3 clients should abide by"""
-
-    def download_file(self, Bucket: str, Key: str, Filename: str) -> None: ...
-
-    def upload_file(self, Filename: str, Bucket: str, Key: str) -> None: ...
-
-    def head_object(self, Bucket: str, Key: str) -> Dict[str, Any]: ...
-
-    def get_object(self, Bucket: str, Key: str, Range: str) -> Dict[str, Any]: ...
-
-    def close(self) -> None: ...
+@cache
+def _get_s3_client() -> "S3Client":
+    session = boto3.Session()
+    kwargs = {
+        "region_name": os.environ.get(ENV_MCORE_S3_REGION, session.region_name),
+        "endpoint_url": os.environ.get(ENV_MCORE_S3_ENDPOINT_URL),
+        "config": Config(retries={"max_attempts": 10, "mode": "standard"}),
+    }
+    return session.client("s3", **kwargs) # type: ignore
 
 
 def is_s3_path(path: str) -> bool:
@@ -66,18 +50,11 @@ def parse_s3_path(path: str) -> Tuple[str, str]:
     Returns:
         Tuple[str, str]: A (bucket, key) tuple
     """
-    assert is_s3_path(path)
-    parts = path.replace(S3_PREFIX, "").split("/")
-    bucket = parts[0]
-    if len(parts) > 1:
-        key = "/".join(parts[1:])
-        assert S3_PREFIX + bucket + "/" + key == path
-    else:
-        key = ""
-    return bucket, key
+    _, bucket, key, _, _, _ = urlparse(path)
+    return bucket, key.lstrip("/")
 
 
-def object_exists(client: S3Client, path: str) -> bool:
+def object_exists(client: "S3Client", path: str) -> bool:
     """Ascertain whether the object at the given S3 path exists in S3
 
     Args:
@@ -100,7 +77,7 @@ def object_exists(client: S3Client, path: str) -> bool:
     return True
 
 
-def _download_file(client: S3Client, s3_path: str, local_path: str) -> None:
+def _download_file(client: "S3Client", s3_path: str, local_path: str) -> None:
     """Download the object at the given S3 path to the given local file system path
 
     Args:
@@ -116,7 +93,7 @@ def _download_file(client: S3Client, s3_path: str, local_path: str) -> None:
     client.download_file(parsed_s3_path[0], parsed_s3_path[1], local_path)
 
 
-def maybe_download_file(s3_path: str, local_path: str) -> None:
+def maybe_download_file(s3_path: str, local_path: str, synchronize_ranks: bool = True) -> None:
     """Download the object at the given S3 path to the given local file system path
 
     In a distributed setting, downloading the S3 object proceeds in stages in order
@@ -127,30 +104,33 @@ def maybe_download_file(s3_path: str, local_path: str) -> None:
         s3_path (str): The S3 source path
 
         local_path (str): The local destination path
+
+        synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks behavior. Set to False when we enforce this behavior at higher level.
     """
 
     if torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
         local_rank = rank % torch.cuda.device_count()
     else:
-        rank = 0
-        local_rank = 0
+        rank = int(os.getenv("RANK", "0"))
+        local_world = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+        local_rank = rank % local_world
 
-    s3_client = boto3.client("s3")
+    s3_client = _get_s3_client()
 
     if (not os.path.exists(local_path)) and (rank == 0):
         _download_file(s3_client, s3_path, local_path)
 
-    if torch.distributed.is_initialized():
+    if synchronize_ranks and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     # If the `local_path` is in a file system that is not
     # shared across all the ranks, then we assume it's in the
     # host file system and each host needs to download the file.
-    if (not os.path.exists(local_path)) and (local_rank == 0):
+    if synchronize_ranks and ((not os.path.exists(local_path)) and (local_rank == 0)):
         _download_file(s3_client, s3_path, local_path)
 
-    if torch.distributed.is_initialized():
+    if synchronize_ranks and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     # If the `local_path` still does not exist, then we assume
@@ -158,7 +138,9 @@ def maybe_download_file(s3_path: str, local_path: str) -> None:
     if not os.path.exists(local_path):
         _download_file(s3_client, s3_path, local_path)
 
-    if torch.distributed.is_initialized():
+    if synchronize_ranks and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    assert os.path.exists(local_path)
+    assert os.path.exists(
+        local_path
+    ), f"{local_path} does not exist {s3_path}, rank={local_rank}, synchronize_ranks={synchronize_ranks}"

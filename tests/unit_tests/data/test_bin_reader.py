@@ -6,7 +6,6 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, Dict
 
 import nltk
-import pytest
 
 try:
     import boto3
@@ -19,12 +18,11 @@ except ModuleNotFoundError:
 
 from megatron.core.datasets.indexed_dataset import (
     IndexedDataset,
-    S3Config,
     _FileBinReader,
     _MMapBinReader,
     _S3BinReader,
 )
-from megatron.core.datasets.utils_s3 import S3_PREFIX, S3Client
+from megatron.core.utils_s3 import S3_PREFIX, S3Client
 from tests.unit_tests.data.test_preprocess_data import (
     build_datasets,
     dummy_jsonl,
@@ -60,7 +58,7 @@ class _LocalClient(S3Client):
 
         filename = os.path.join("/", Bucket, Key)
 
-        with open(filename, mode='rb', buffering=0) as bin_buffer_file:
+        with open(filename, mode="rb", buffering=0) as bin_buffer_file:
             bin_buffer_file.seek(_range_beg)
             _bytes = bin_buffer_file.read(_range_end - _range_beg)
 
@@ -72,8 +70,13 @@ class _LocalClient(S3Client):
         pass
 
 
-setattr(boto3, "client", _LocalClient)
+class _LocalSession(boto3.Session):
+    def client(self, *args, **kwargs):
+        return _LocalClient()
 
+
+setattr(boto3, "client", _LocalClient)
+setattr(boto3, "Session", _LocalSession)
 
 ##
 # Overload ClientError from botocore.exceptions
@@ -89,8 +92,6 @@ class _LocalClientError(Exception):
 setattr(exceptions, "ClientError", _LocalClientError)
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_bin_reader():
     with tempfile.TemporaryDirectory() as temp_dir:
         # set the default nltk data path
@@ -122,7 +123,7 @@ def test_bin_reader():
                 "--workers",
                 "10",
                 "--log-interval",
-                "1",
+                "100",
             ],
         )
 
@@ -145,7 +146,7 @@ def test_bin_reader():
                 S3_PREFIX + prefix,
                 multimodal=False,
                 mmap=False,
-                s3_config=S3Config(path_to_idx_cache=path_to_s3_cache),
+                bin_chunk_ntokens=10,
             )
             assert isinstance(indexed_dataset_s3.bin_reader, _S3BinReader)
 

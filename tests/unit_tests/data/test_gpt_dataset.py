@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset, _block_shuffle, _build_shuffle_index
 from megatron.core.datasets.utils import compile_helpers
 from megatron.training.tokenizer.tokenizer import _NullTokenizer
 from tests.unit_tests.test_utilities import Utils
@@ -47,9 +47,7 @@ def test_mock_gpt_dataset():
         tokenizer=tokenizer,
     )
 
-    datasets = BlendedMegatronDatasetBuilder(
-        MockGPTDataset, [100, 100, 100], lambda: True, config
-    ).build()
+    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [100, 100, 100], lambda: True, config).build()
 
     N = 10
 
@@ -81,30 +79,66 @@ def test_mock_gpt_dataset():
         tokenizer=tokenizer,
     )
 
-    datasets = BlendedMegatronDatasetBuilder(
-        MockGPTDataset, [0, None, 0], lambda: True, config
-    ).build()
+    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [0, None, 0], lambda: True, config).build()
 
     sample = datasets[1][datasets[1].shuffle_index.argmax()]
-    argmax = sample['labels'].shape[0] - torch.flip(sample['labels'], [0]).argmax() - 1
+    argmax = sample["labels"].shape[0] - torch.flip(sample["labels"], [0]).argmax() - 1
 
     # Test add_extra_token_to_sequence
-    assert sample['tokens'][argmax] != tokenizer.eod
-    assert sample['labels'][argmax] == tokenizer.eod
+    assert sample["tokens"][argmax] != tokenizer.eod
+    assert sample["labels"][argmax] == tokenizer.eod
 
     # Test eod_mask_loss, drop_last_partial_validation_sequence
-    assert argmax < sample['labels'].shape[0] - 1
-    assert torch.all(sample['labels'][argmax + 1 :] == 0)
+    assert argmax < sample["labels"].shape[0] - 1
+    assert torch.all(sample["labels"][argmax + 1 :] == 0)
     assert not torch.any(
-        sample['loss_mask'][
-            torch.logical_and(sample['labels'] == tokenizer.eod, sample['labels'] == 0)
-        ]
+        sample["loss_mask"][torch.logical_and(sample["labels"] == tokenizer.eod, sample["labels"] == 0)]
     )
 
     sample = datasets[1][None]
 
     # Check handling of None index
-    assert not torch.any(sample['loss_mask'])
+    assert not torch.any(sample["loss_mask"])
+
+
+def test_build_shuffle_index_equivalence_to_block_shuffle():
+    shuffled = _build_shuffle_index(12, 12, numpy.random.RandomState(seed=0))
+    block_one_shuffled = _build_shuffle_index(12, 12, numpy.random.RandomState(seed=0), shuffle_block_size=1)
+    block_all_shuffled = _build_shuffle_index(12, 12, numpy.random.RandomState(seed=0), shuffle_block_size=12)
+    assert numpy.array_equal(shuffled, block_one_shuffled)
+    assert numpy.array_equal(shuffled, block_all_shuffled)
+
+
+def test_block_shuffle():
+    np_rng = numpy.random.RandomState(seed=0)
+
+    # Regular case with shuffle_block_size > 1
+    arr = numpy.arange(start=0, stop=12, step=1)
+    shuffle_block_size = 4
+    shuffled = _block_shuffle(arr.copy(), shuffle_block_size, np_rng)
+    expected = numpy.array([10, 11, 8, 9, 4, 6, 5, 7, 3, 0, 2, 1])
+    assert numpy.array_equal(shuffled, expected), f"block_size=4: {shuffled}"
+
+    # shuffle_block_size = 1, equivalent to full array shuffle
+    arr = numpy.array([0, 1, 2, 3, 4, 5])
+    shuffle_block_size = 1
+    shuffled = _block_shuffle(arr.copy(), shuffle_block_size, np_rng)
+    expected = numpy.array([3, 1, 2, 4, 5, 0])
+    assert numpy.array_equal(shuffled, expected), f"block_size=1: {shuffled}"
+
+    # Empty array
+    arr = numpy.array([])
+    shuffle_block_size = 4
+    shuffled = _block_shuffle(arr.copy(), shuffle_block_size, np_rng)
+    expected = numpy.array([])
+    assert numpy.array_equal(shuffled, expected), f"empty: {shuffled}"
+
+    # Single element
+    arr = numpy.array([42])
+    shuffle_block_size = 1
+    shuffled = _block_shuffle(arr.copy(), shuffle_block_size, np_rng)
+    expected = numpy.array([42])
+    assert numpy.array_equal(shuffled, expected), f"single element: {shuffled}"
 
 
 if __name__ == "__main__":
